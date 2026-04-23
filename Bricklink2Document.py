@@ -8,9 +8,11 @@ import sys
 import io
 import json
 import re
+import shutil
 import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from urllib.parse import quote
 from dataclasses import dataclass
 from typing import Optional
 
@@ -26,6 +28,8 @@ from PyQt6.QtGui import QPixmap, QFont
 
 import requests
 from PIL import Image as PILImage
+
+PILImage.MAX_IMAGE_PIXELS = 10_000_000
 
 import openpyxl
 from openpyxl.drawing.image import Image as XLImage
@@ -43,7 +47,6 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 from docx import Document as DocxDocument
 from docx.shared import Inches, Pt, RGBColor, Cm
-from docx.enum.table import WD_ALIGN_VERTICAL
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
@@ -128,7 +131,7 @@ class BricklinkItem:
     @property
     def image_urls(self) -> list[str]:
         """Ordered list of URLs to try; first valid image response wins."""
-        iid = self.item_id
+        iid = quote(self.item_id, safe="")
         if self.item_type == "S":
             return [
                 f"https://img.bricklink.com/ItemImage/ST/0/{iid}.t2.png",
@@ -145,10 +148,9 @@ class BricklinkItem:
 
     @property
     def catalog_url(self) -> str:
-        type_char = {"P": "P", "S": "S", "M": "M", "G": "G",
-                     "B": "B", "C": "C", "I": "I"}.get(self.item_type, "P")
+        type_char = self.item_type if self.item_type in ITEM_TYPES else "P"
         return (f"https://www.bricklink.com/v2/catalog/catalogitem.page"
-                f"?{type_char}={self.item_id}")
+                f"?{type_char}={quote(self.item_id, safe='')}")
 
     @property
     def price_label(self) -> str:
@@ -167,16 +169,19 @@ def parse_xml(path: str) -> list[BricklinkItem]:
     for el in root.findall("ITEM"):
         def get(tag: str, default: str = "") -> str:
             return (el.findtext(tag) or default).strip()
-        items.append(BricklinkItem(
-            item_type=get("ITEMTYPE", "P"),
-            item_id=get("ITEMID"),
-            color_id=int(get("COLOR", "0")),
-            max_price=float(get("MAXPRICE", "-1")),
-            min_qty=int(get("MINQTY", "1")),
-            condition=get("CONDITION", "N"),
-            notify=get("NOTIFY", "N"),
-            source_file=filename,
-        ))
+        try:
+            items.append(BricklinkItem(
+                item_type=get("ITEMTYPE", "P"),
+                item_id=get("ITEMID"),
+                color_id=int(get("COLOR", "0")),
+                max_price=float(get("MAXPRICE", "-1")),
+                min_qty=int(get("MINQTY", "1")),
+                condition=get("CONDITION", "N"),
+                notify=get("NOTIFY", "N"),
+                source_file=filename,
+            ))
+        except (ValueError, TypeError):
+            continue
     return items
 
 
@@ -251,18 +256,21 @@ class ImageDownloadThread(QThread):
                 break
 
             # --- image ---
-            cache_key = f"{item.item_type}_{item.color_id}_{item.item_id}.png"
+            safe_id = re.sub(r"[^\w\-]", "_", item.item_id)
+            cache_key = f"{item.item_type}_{item.color_id}_{safe_id}.png"
             cache_file = self.cache_dir / cache_key
             if cache_file.exists():
                 self.image_ready.emit(i, cache_file.read_bytes())
             else:
                 self.status_msg.emit(f"Downloading image {item.item_id} …")
+                _MAX_IMG = 5 * 1024 * 1024
                 data = b""
                 for url in item.image_urls:
                     try:
                         resp = requests.get(url, timeout=10, headers=self._HEADERS)
                         if (resp.status_code == 200 and
-                                resp.headers.get("Content-Type", "").startswith("image/")):
+                                resp.headers.get("Content-Type", "").startswith("image/") and
+                                len(resp.content) <= _MAX_IMG):
                             data = resp.content
                             break
                     except Exception:
@@ -430,7 +438,6 @@ def export_pdf(items: list["BricklinkItem"], path: str, col_cfg: dict[str, bool]
     tmp_dir = Path(tempfile.mkdtemp(prefix="bl_pdf_"))
     header_row = [Paragraph(c, ps_hdr) for c in visible]
     table_data: list[list] = [header_row]
-    tmp_files: list[Path] = []
 
     for idx, item in enumerate(items):
         values = _item_values(item, idx)
@@ -443,7 +450,6 @@ def export_pdf(items: list["BricklinkItem"], path: str, col_cfg: dict[str, bool]
                     if pil_img:
                         tf = tmp_dir / f"img_{idx}.png"
                         pil_img.save(tf, format="PNG")
-                        tmp_files.append(tf)
                         cell = RLImage(str(tf), width=IMG_MM * mm, height=IMG_MM * mm,
                                        kind="proportional")
                 row.append(cell)
@@ -477,11 +483,7 @@ def export_pdf(items: list["BricklinkItem"], path: str, col_cfg: dict[str, bool]
     )
     doc.build([Paragraph("Bricklink Inventory", title_style), table])
 
-    for f in tmp_files:
-        try:
-            f.unlink()
-        except OSError:
-            pass
+    shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -548,7 +550,6 @@ def export_word(items: list["BricklinkItem"], path: str,
             row.cells[i].width = Cm(w)
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="bl_word_"))
-    tmp_files: list[Path] = []
 
     for idx, item in enumerate(items):
         row = table.add_row()
@@ -566,7 +567,6 @@ def export_word(items: list["BricklinkItem"], path: str,
                     if pil_img:
                         tf = tmp_dir / f"img_{idx}.png"
                         pil_img.save(tf, format="PNG")
-                        tmp_files.append(tf)
                         p = cell.paragraphs[0]
                         p.alignment = 1  # center
                         col_w_in = col_widths_cm[i] / 2.54
@@ -580,11 +580,7 @@ def export_word(items: list["BricklinkItem"], path: str,
 
     doc.save(path)
 
-    for f in tmp_files:
-        try:
-            f.unlink()
-        except OSError:
-            pass
+    shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -600,22 +596,8 @@ CONFIG_FILE = Path(__file__).parent / "config.json"
 DEFAULT_COLUMN_VIS: dict[str, bool] = {col: True for col in COLUMNS}
 
 
-def _row_key(item: "BricklinkItem") -> str:
-    return f"{item.source_file}|{item.item_type}|{item.item_id}|{item.color_id}"
-
-
-def _apply_saved_order(items: list, row_order: list[str]) -> list:
-    """Sort items to match the saved row order; unknown items go to the end."""
-    if not row_order:
-        return items
-    key_map = {_row_key(item): item for item in items}
-    ordered = [key_map.pop(k) for k in row_order if k in key_map]
-    ordered.extend(key_map.values())   # items not in saved order appended at end
-    return ordered
-
-
-def load_config() -> tuple[dict[str, bool], list[str], list[str]]:
-    """Returns (column_visibility, row_order, col_order)."""
+def load_config() -> tuple[dict[str, bool], list[str]]:
+    """Returns (column_visibility, col_order)."""
     default_cols = dict(DEFAULT_COLUMN_VIS)
     if CONFIG_FILE.exists():
         try:
@@ -624,22 +606,25 @@ def load_config() -> tuple[dict[str, bool], list[str], list[str]]:
                 cols = dict(DEFAULT_COLUMN_VIS)
                 cols.update({k: bool(v) for k, v in data["columns"].items()
                              if k in DEFAULT_COLUMN_VIS})
-                return cols, data.get("row_order", []), data.get("col_order", [])
+                return cols, data.get("col_order", [])
             else:                                             # old flat format
                 cols = dict(DEFAULT_COLUMN_VIS)
                 cols.update({k: bool(v) for k, v in data.items()
                              if k in DEFAULT_COLUMN_VIS})
-                return cols, [], []
+                return cols, []
         except Exception:
             pass
-    return default_cols, [], []
+    return default_cols, []
 
 
-def save_config(col_vis: dict[str, bool], row_order: list[str], col_order: list[str]) -> None:
-    CONFIG_FILE.write_text(
-        json.dumps({"columns": col_vis, "row_order": row_order, "col_order": col_order}, indent=2),
-        encoding="utf-8"
-    )
+def save_config(col_vis: dict[str, bool], col_order: list[str]) -> None:
+    try:
+        CONFIG_FILE.write_text(
+            json.dumps({"columns": col_vis, "col_order": col_order}, indent=2),
+            encoding="utf-8"
+        )
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -750,7 +735,7 @@ class MainWindow(QMainWindow):
         self.items: list[BricklinkItem] = []
         self.cache_dir = Path(tempfile.mkdtemp(prefix="bl_cache_"))
         self._dl_thread: Optional[ImageDownloadThread] = None
-        self._col_cfg, self._row_order, self._col_order = load_config()
+        self._col_cfg, self._col_order = load_config()
         self._desc_cache = _load_desc_cache()
 
         self._build_ui()
@@ -799,6 +784,10 @@ class MainWindow(QMainWindow):
         self.table = DraggableTable()
         self.table.setColumnCount(len(COLUMNS))
         self.table.setHorizontalHeaderLabels(COLUMNS)
+        self.table.setDragEnabled(True)
+        self.table.setAcceptDrops(True)
+        self.table.setDragDropMode(QTableWidget.DragDropMode.InternalMove)
+        self.table.setDragDropOverwriteMode(False)
         self.table.setEditTriggers(QTableWidget.EditTrigger.DoubleClicked)
         self.table.setItemDelegate(ReadOnlyDelegate(self.table))
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -851,13 +840,13 @@ class MainWindow(QMainWindow):
     def _on_col_moved(self, *_) -> None:
         hh = self.table.horizontalHeader()
         self._col_order = [COLUMNS[hh.logicalIndex(v)] for v in range(hh.count())]
-        save_config(self._col_cfg, self._row_order, self._col_order)
+        save_config(self._col_cfg, self._col_order)
 
     def _open_column_config(self) -> None:
         dlg = ColumnConfigDialog(self._col_cfg, parent=self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._col_cfg = dlg.result_config()
-            save_config(self._col_cfg, self._row_order, self._col_order)
+            save_config(self._col_cfg, self._col_order)
             self._apply_column_visibility()
 
     # ------------------------------------------------------------------
@@ -884,7 +873,7 @@ class MainWindow(QMainWindow):
         if not all_items:
             return
 
-        self.items = _apply_saved_order(all_items, self._row_order)
+        self.items = all_items
         file_count = len(paths)
         names = ", ".join(Path(p).name for p in paths)
         self.lbl_file.setText(names if file_count == 1 else f"{file_count} files loaded")
@@ -996,18 +985,6 @@ class MainWindow(QMainWindow):
 
     def _on_order_changed(self, *_) -> None:
         self._refresh_image_widgets()
-        self._save_row_order()
-
-    def _save_row_order(self) -> None:
-        order: list[str] = []
-        for row in range(self.table.rowCount()):
-            cell = self.table.item(row, 0)
-            if cell is not None:
-                bl_item = cell.data(Qt.ItemDataRole.UserRole)
-                if isinstance(bl_item, BricklinkItem):
-                    order.append(_row_key(bl_item))
-        self._row_order = order
-        save_config(self._col_cfg, self._row_order, self._col_order)
 
     def _refresh_image_widgets(self) -> None:
         for row in range(self.table.rowCount()):
@@ -1052,7 +1029,7 @@ class MainWindow(QMainWindow):
             left = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
             c = QTableWidgetItem(desc)
             c.setTextAlignment(left)
-            self.table.setItem(row, 4, c)
+            self.table.setItem(row, COLUMNS.index("Description"), c)
 
     def _on_image_ready(self, idx: int, data: bytes) -> None:
         bl_item = self.items[idx]
@@ -1091,6 +1068,7 @@ class MainWindow(QMainWindow):
         if self._dl_thread and self._dl_thread.isRunning():
             self._dl_thread.abort()
             self._dl_thread.wait()
+        shutil.rmtree(self.cache_dir, ignore_errors=True)
         super().closeEvent(event)
 
 

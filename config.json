@@ -1,0 +1,16 @@
+{
+  "columns": {
+    "#": true,
+    "Image": true,
+    "Source File": true,
+    "Part ID": true,
+    "Description": true,
+    "Color ID": false,
+    "Color Name": true,
+    "Type": false,
+    "Qty": true,
+    "Condition": false,
+    "Max Price": false
+  },
+  "col_order": []
+}
