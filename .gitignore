@@ -210,5 +210,5 @@ __marimo__/
 
 # additions
 descriptions.json
-.xml
+*.xml
 
