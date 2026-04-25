@@ -756,14 +756,16 @@ class MainWindow(QMainWindow):
         # ---- toolbar ----
         hbox = QHBoxLayout()
         self.btn_open    = QPushButton("Open XML …")
+        self.btn_combine = QPushButton("Combine Lots")
         self.btn_excel   = QPushButton("Export Excel")
         self.btn_pdf     = QPushButton("Export PDF")
         self.btn_word    = QPushButton("Export Word")
         self.btn_columns = QPushButton("Columns …")
-        for btn in (self.btn_open, self.btn_excel, self.btn_pdf, self.btn_word, self.btn_columns):
+        for btn in (self.btn_open, self.btn_combine, self.btn_excel, self.btn_pdf, self.btn_word, self.btn_columns):
             btn.setMinimumHeight(34)
             btn.setFont(QFont("Segoe UI", 10))
             hbox.addWidget(btn)
+        self.btn_combine.setEnabled(False)
         self.btn_excel.setEnabled(False)
         self.btn_pdf.setEnabled(False)
         self.btn_word.setEnabled(False)
@@ -812,6 +814,7 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.sb)
 
         self.btn_open.clicked.connect(self._open_xml)
+        self.btn_combine.clicked.connect(self._combine_lots)
         self.btn_excel.clicked.connect(self._export_excel)
         self.btn_pdf.clicked.connect(self._export_pdf)
         self.btn_word.clicked.connect(self._export_word)
@@ -879,10 +882,43 @@ class MainWindow(QMainWindow):
         self.lbl_file.setText(names if file_count == 1 else f"{file_count} files loaded")
         self.sb.showMessage(f"Loaded {len(self.items)} items from {file_count} file(s).")
         self._populate_table()
+        self.btn_combine.setEnabled(True)
         self.btn_excel.setEnabled(True)
         self.btn_pdf.setEnabled(True)
         self.btn_word.setEnabled(True)
         self._start_downloads()
+
+    def _combine_lots(self) -> None:
+        groups: dict[tuple, list[BricklinkItem]] = {}
+        for item in self.items:
+            key = (item.item_type, item.item_id, item.color_id)
+            groups.setdefault(key, []).append(item)
+
+        merged: list[BricklinkItem] = []
+        for group in groups.values():
+            if len(group) == 1:
+                merged.append(group[0])
+            else:
+                base = group[0]
+                # Collect unique source names in order
+                seen_names: list[str] = []
+                for it in group:
+                    for name in it.source_file.split(" & "):
+                        if name and name not in seen_names:
+                            seen_names.append(name)
+                base.source_file = " & ".join(seen_names)
+                base.min_qty = sum(it.min_qty for it in group)
+                merged.append(base)
+
+        removed = len(self.items) - len(merged)
+        self.items = merged
+        self._populate_table()
+        if removed:
+            self.sb.showMessage(
+                f"Combined {removed} duplicate(s) — {len(merged)} unique lot(s) remain.", 8000
+            )
+        else:
+            self.sb.showMessage("No duplicates found.", 5000)
 
     def _export_excel(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
